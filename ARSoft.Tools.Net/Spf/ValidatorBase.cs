@@ -1,14 +1,14 @@
-﻿#region Copyright and License
+#region Copyright and License
 // Copyright 2010..2024 Alexander Reinert
-// 
+//
 // This file is part of the ARSoft.Tools.Net - C# DNS client/server and SPF Library (https://github.com/alexreinert/ARSoft.Tools.Net)
-// 
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
-// 
+//
 //   http://www.apache.org/licenses/LICENSE-2.0
-// 
+//
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -16,16 +16,11 @@
 // limitations under the License.
 #endregion
 
-using System;
-using System.Collections.Generic;
-using System.Linq;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
 using ARSoft.Tools.Net.Dns;
 
 namespace ARSoft.Tools.Net.Spf
@@ -141,7 +136,10 @@ namespace ARSoft.Tools.Net.Spf
 		{
 			if ((domain == null) || (domain.IsRoot))
 			{
-				return new ValidationResult() { Result = SpfQualifier.None, Explanation = String.Empty };
+				return new ValidationResult() {
+					Result = SpfQualifier.None,
+					Explanation = expandExplanation ? $"Domain '{domain}' is null or root" : String.Empty
+				};
 			}
 
 			if (String.IsNullOrEmpty(sender))
@@ -157,16 +155,25 @@ namespace ARSoft.Tools.Net.Spf
 
 			if (!loadResult.CouldBeLoaded)
 			{
-				return new ValidationResult() { Result = loadResult.ErrorResult, Explanation = String.Empty };
+				return new ValidationResult() {
+					Result = loadResult.ErrorResult,
+					Explanation = expandExplanation ? $"Failed to load SPF record for domain '{domain}'. {(loadResult.ErrorResult == SpfQualifier.TempError ? "Temporary DNS error encountered." : "No valid SPF record found.")}" : String.Empty
+				};
 			}
 
 			T record = loadResult.Record!;
 
 			if ((record.Terms == null) || (record.Terms.Count == 0))
-				return new ValidationResult() { Result = SpfQualifier.Neutral, Explanation = String.Empty };
+				return new ValidationResult() {
+					Result = SpfQualifier.Neutral,
+					Explanation = expandExplanation ? $"No terms found in SPF record for domain '{domain}'. The SPF record exists but contains no mechanisms or modifiers." : String.Empty
+				};
 
 			if (record.Terms.OfType<SpfModifier>().GroupBy(m => m.Type).Where(g => (g.Key == SpfModifierType.Exp) || (g.Key == SpfModifierType.Redirect)).Any(g => g.Count() > 1))
-				return new ValidationResult() { Result = SpfQualifier.PermError, Explanation = String.Empty };
+				return new ValidationResult() {
+					Result = SpfQualifier.PermError,
+					Explanation = expandExplanation ? $"Multiple exp or redirect modifiers found in SPF record for domain '{domain}'. This violates RFC 7208 which allows only one of each modifier type." : String.Empty
+				};
 
 			ValidationResult result = new ValidationResult() { Result = loadResult.ErrorResult };
 
@@ -174,13 +181,99 @@ namespace ARSoft.Tools.Net.Spf
 			foreach (SpfMechanism mechanism in record.Terms.OfType<SpfMechanism>())
 			{
 				if (state.DnsLookupCount > DnsLookupLimit)
-					return new ValidationResult() { Result = SpfQualifier.PermError, Explanation = String.Empty };
+					return new ValidationResult() {
+						Result = SpfQualifier.PermError,
+						Explanation = expandExplanation ? $"DNS lookup limit exceeded ({state.DnsLookupCount} > {DnsLookupLimit}). RFC 7208 limits the number of DNS lookups to prevent resource exhaustion attacks." : String.Empty
+					};
 
 				SpfQualifier qualifier = await CheckMechanismAsync(mechanism, ip, domain, sender, state, token);
 
 				if (qualifier != SpfQualifier.None)
 				{
 					result.Result = qualifier;
+
+					if (expandExplanation && (qualifier != SpfQualifier.Pass))
+					{
+						string mechanismDomain = String.IsNullOrEmpty(mechanism.Domain) ? domain.ToString() : mechanism.Domain;
+
+						switch (mechanism.Type)
+						{
+							case SpfMechanismType.All:
+								result.Explanation = $"Matched 'all' mechanism with qualifier '{qualifier}'. This is a catch-all mechanism that matches any IP address.";
+								break;
+							case SpfMechanismType.A:
+								result.Explanation = qualifier switch
+								{
+									SpfQualifier.PermError =>
+										$"DNS lookup limit exceeded while checking A records for domain '{mechanismDomain}'.",
+									SpfQualifier.TempError =>
+										$"Temporary DNS error while checking A records for domain '{mechanismDomain}'.",
+									_ =>
+										$"IP {ip} did not match A records for domain '{mechanismDomain}' with qualifier '{qualifier}'."
+								};
+								break;
+							case SpfMechanismType.Mx:
+								result.Explanation = qualifier switch
+								{
+									SpfQualifier.PermError =>
+										$"DNS lookup limit exceeded while checking MX records for domain '{mechanismDomain}'.",
+									SpfQualifier.TempError =>
+										$"Temporary DNS error while checking MX records for domain '{mechanismDomain}'.",
+									_ =>
+										$"IP {ip} did not match MX records for domain '{mechanismDomain}' with qualifier '{qualifier}'."
+								};
+								break;
+							case SpfMechanismType.Ip4:
+							case SpfMechanismType.Ip6:
+								if (qualifier == SpfQualifier.PermError)
+									result.Explanation = $"Invalid IP range or prefix in '{mechanismDomain}{(mechanism.Prefix.HasValue ? "/" + mechanism.Prefix : "")}' mechanism.";
+								else
+									result.Explanation = $"IP {ip} did not match specified IP range '{mechanismDomain}{(mechanism.Prefix.HasValue ? "/" + mechanism.Prefix : "")}' with qualifier '{qualifier}'.";
+								break;
+							case SpfMechanismType.Ptr:
+								result.Explanation = qualifier switch
+								{
+									SpfQualifier.PermError =>
+										$"DNS lookup limit exceeded while checking PTR records for IP {ip}.",
+									SpfQualifier.TempError => $"Temporary DNS error while checking PTR records for IP {ip}.",
+									_ =>
+										$"Reverse DNS for IP {ip} did not match domain '{mechanismDomain}' with qualifier '{qualifier}'."
+								};
+								break;
+							case SpfMechanismType.Exists:
+								result.Explanation = qualifier switch
+								{
+									SpfQualifier.PermError when String.IsNullOrEmpty(mechanism.Domain) =>
+										$"Invalid exists mechanism: domain is empty.",
+									SpfQualifier.PermError =>
+										$"DNS lookup limit exceeded while checking exists mechanism for domain '{mechanismDomain}'.",
+									SpfQualifier.TempError =>
+										$"Temporary DNS error while checking exists mechanism for domain '{mechanismDomain}'.",
+									_ =>
+										$"Domain '{mechanismDomain}' does not have A records (exists mechanism) with qualifier '{qualifier}'."
+								};
+								break;
+							case SpfMechanismType.Include:
+								result.Explanation = qualifier switch
+								{
+									SpfQualifier.PermError when String.IsNullOrEmpty(mechanism.Domain) =>
+										$"Invalid include mechanism: domain is empty.",
+									SpfQualifier.PermError when mechanismDomain == domain.ToString() =>
+										$"Invalid include mechanism: domain '{mechanismDomain}' includes itself.",
+									SpfQualifier.PermError =>
+										$"Permanent error in included domain '{mechanismDomain}'. Either the domain has no valid SPF record or DNS lookup limit was exceeded.",
+									SpfQualifier.TempError =>
+										$"Temporary DNS error while checking included domain '{mechanismDomain}'.",
+									_ =>
+										$"Include check for domain '{mechanismDomain}' did not pass with qualifier '{qualifier}'."
+								};
+								break;
+							case SpfMechanismType.Unknown:
+							default:
+								result.Explanation = $"Unknown mechanism type '{mechanism.Type}' returned {qualifier}.";
+								break;
+						}
+					}
 					break;
 				}
 			}
@@ -192,21 +285,46 @@ namespace ARSoft.Tools.Net.Spf
 				SpfModifier? redirectModifier = record.Terms.OfType<SpfModifier>().FirstOrDefault(m => m.Type == SpfModifierType.Redirect);
 				if (redirectModifier != null)
 				{
-					if (++state.DnsLookupCount > 10)
-						return new ValidationResult() { Result = SpfQualifier.PermError, Explanation = String.Empty };
+					if (++state.DnsLookupCount > DnsLookupLimit)
+						return new ValidationResult() {
+							Result = SpfQualifier.PermError,
+							Explanation = expandExplanation ? $"DNS lookup limit exceeded during redirect (> {DnsLookupLimit}). RFC 7208 limits the number of DNS lookups to prevent resource exhaustion attacks." : String.Empty
+						};
 
 					DomainName redirectDomain = await ExpandDomainAsync(redirectModifier.Domain ?? String.Empty, ip, domain, sender, token);
 
 					if ((redirectDomain == null) || (redirectDomain.IsRoot) || (redirectDomain.Equals(domain)))
 					{
 						result.Result = SpfQualifier.PermError;
+						if (expandExplanation)
+						{
+							if (redirectDomain == null || redirectDomain.IsRoot)
+								result.Explanation = $"Invalid redirect domain: {(redirectDomain == null ? "null" : "root domain")}. The redirect modifier must specify a valid domain.";
+							else if (redirectDomain.Equals(domain))
+								result.Explanation = $"Invalid redirect domain: '{redirectDomain}' redirects to itself, which would cause an infinite loop.";
+							else
+								result.Explanation = $"Invalid redirect domain: '{redirectDomain}'.";
+						}
 					}
 					else
 					{
 						result = await CheckHostInternalAsync(ip, redirectDomain, sender, expandExplanation, state, token);
 
 						if (result.Result == SpfQualifier.None)
+						{
 							result.Result = SpfQualifier.PermError;
+							if (expandExplanation)
+								result.Explanation = $"No valid SPF record found at redirect domain '{redirectDomain}'.";
+						}
+						else
+							result.Explanation = expandExplanation switch
+							{
+								true when string.IsNullOrEmpty(result.Explanation) =>
+									$"Redirected from '{domain}' to '{redirectDomain}': {result.Result}",
+								true when !string.IsNullOrEmpty(result.Explanation) =>
+									$"Redirected from '{domain}' to '{redirectDomain}': {result.Explanation}",
+								_ => result.Explanation
+							};
 					}
 				}
 			}
@@ -219,7 +337,9 @@ namespace ARSoft.Tools.Net.Spf
 
 					if (target.IsRoot)
 					{
-						result.Explanation = String.Empty;
+						// Don't clear explanation if we've already set it with our detailed information
+						if (string.IsNullOrEmpty(result.Explanation))
+							result.Explanation = String.Empty;
 					}
 					else
 					{
@@ -229,7 +349,13 @@ namespace ARSoft.Tools.Net.Spf
 							TxtRecord? txtRecord = dnsResult.Records?.FirstOrDefault();
 							if (txtRecord != null)
 							{
-								result.Explanation = (await ExpandMacroAsync(txtRecord.TextData, ip, domain, sender, token)).ToString();
+								string explanation = (await ExpandMacroAsync(txtRecord.TextData, ip, domain, sender, token)).ToString();
+
+								// If we already have a detailed explanation, append the domain's explanation
+								if (!string.IsNullOrEmpty(result.Explanation))
+									result.Explanation += $". Domain explanation: {explanation}";
+								else
+									result.Explanation = $"Domain explanation: {explanation}";
 							}
 						}
 					}
@@ -239,6 +365,13 @@ namespace ARSoft.Tools.Net.Spf
 
 			if (result.Result == SpfQualifier.None)
 				result.Result = SpfQualifier.Neutral;
+
+			// If expandExplanation is true and we have a non-passing result but no explanation, add a generic one
+			if (expandExplanation && string.IsNullOrEmpty(result.Explanation) &&
+				(result.Result != SpfQualifier.Pass && result.Result != SpfQualifier.Neutral))
+			{
+				result.Explanation = $"SPF check for domain '{domain}' with IP {ip} resulted in {result.Result}. No specific mechanism matched.";
+			}
 
 			return result;
 		}
